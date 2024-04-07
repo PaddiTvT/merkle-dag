@@ -2,19 +2,7 @@ package merkledag
 
 import (
 	"encoding/json"
-	"fmt"
 	"hash"
-	"math"
-)
-
-const (
-	K            = 1 << 10
-	M            = K << 10
-	CHUNK_SIZE   = 256 * K
-	MAX_LISTLINE = 4096
-	BLOB         = "blob"
-	LIST         = "link"
-	TREE         = "tree"
 )
 
 type Link struct {
@@ -28,179 +16,185 @@ type Object struct {
 	Data  []byte
 }
 
-func Add(store KVStore, node Node, h hash.Hash) []byte {
-	// TODO 将分片写入到KVStore中，并返回Merkle Root
-	return processNode(node, store, h)
-
-}
-
-// 处理节点，返回默克尔树根
-func processNode(node Node, store KVStore, h hash.Hash) []byte {
-	obj := &Object{}
-	switch node.Type() {
-	case FILE:
-		obj = handleFile(node, store, h)
-		break
-	case DIR:
-		obj = handleDir(node, store, h)
-		break
-	}
-	jsonObj, _ := json.Marshal(obj)
-	return computeHash(jsonObj, h)
-
-}
-
-// 处理文件，返回一个该文件对应的obj
-func handleFile(node Node, store KVStore, h hash.Hash) *Object {
-	obj := &Object{}
-	FileNode, _ := node.(File)
-	if FileNode.Size() > CHUNK_SIZE {
-
-		// lowobj := Object{}
-		// 计算文件切片数量,向上取整
-		numChunks := math.Ceil(float64(FileNode.Size()) / float64(CHUNK_SIZE))
-		height := 0
-		tmp := numChunks
-		// 计算出要分几层
-		for {
-			height++
-			tmp /= MAX_LISTLINE
-			if tmp == 0 {
+func dfsForSliceFile(hight int, node File, store KVStore, seedId int, h hash.Hash) (*Object, int) {
+	// fmt.Println(hight)
+	// if hight < 1 {
+	// 	panic("invade!")
+	// }
+	if hight == 1 {
+		if (len(node.Bytes()) - seedId) <= 256*1024 {
+			data := node.Bytes()[seedId:]
+			blob := Object{
+				Links: nil,
+				Data:  data,
+			}
+			jsonMarshal, _ := json.Marshal(blob)
+			h.Reset()
+			h.Write(jsonMarshal)
+			flag, _ := store.Has(h.Sum(nil))
+			if !flag {
+				store.Put(h.Sum(nil), data)
+			}
+			return &blob, len(data)
+		}
+		links := &Object{}
+		lenData := 0
+		for i := 1; i <= 4096; i++ {
+			end := seedId + 256*1024
+			if len(node.Bytes()) < end {
+				end = len(node.Bytes())
+			}
+			data := node.Bytes()[seedId:end]
+			blob := Object{
+				Links: nil,
+				Data:  data,
+			}
+			lenData += len(data)
+			jsonMarshal, _ := json.Marshal(blob)
+			h.Reset()
+			h.Write(jsonMarshal)
+			flag, _ := store.Has(h.Sum(nil))
+			if !flag {
+				store.Put(h.Sum(nil), data)
+			}
+			links.Links = append(links.Links, Link{
+				Hash: h.Sum(nil),
+				Size: len(data),
+			})
+			links.Data = append(links.Data, []byte("blob")...)
+			seedId += 256 * 1024
+			if seedId >= len(node.Bytes()) {
 				break
 			}
 		}
-		obj, _ = dfshandleFile(height, FileNode, store, 0, h)
+		jsonMarshal, _ := json.Marshal(links)
+		h.Reset()
+		h.Write(jsonMarshal)
+		flag, _ := store.Has(h.Sum(nil))
+		if !flag {
+			store.Put(h.Sum(nil), jsonMarshal)
+		}
+		return links, lenData
 	} else {
-		obj.Data = FileNode.Bytes()
-		putObjInStore(obj, store, h)
+		links := &Object{}
+		lenData := 0
+		for i := 1; i <= 4096; i++ {
+			if seedId >= len(node.Bytes()) {
+				break
+			}
+			tmp, lens := dfsForSliceFile(hight-1, node, store, seedId, h)
+			lenData += lens
+			jsonMarshal, _ := json.Marshal(tmp)
+			h.Reset()
+			h.Write(jsonMarshal)
+			links.Links = append(links.Links, Link{
+				Hash: h.Sum(nil),
+				Size: lens,
+			})
+			typeName := "link"
+			if tmp.Links == nil {
+				typeName = "blob"
+			}
+			links.Data = append(links.Data, []byte(typeName)...)
+		}
+		jsonMarshal, _ := json.Marshal(links)
+		h.Reset()
+		h.Write(jsonMarshal)
+		flag, _ := store.Has(h.Sum(nil))
+		if !flag {
+			store.Put(h.Sum(nil), jsonMarshal)
+		}
+		return links, lenData
 	}
-	return obj
-
+}
+func sliceFile(node File, store KVStore, h hash.Hash) *Object {
+	if len(node.Bytes()) <= 256*1024 {
+		data := node.Bytes()
+		blob := Object{
+			Links: nil,
+			Data:  data,
+		}
+		jsonMarshal, _ := json.Marshal(blob)
+		h.Reset()
+		h.Write(jsonMarshal)
+		flag, _ := store.Has(h.Sum(nil))
+		if !flag {
+			store.Put(h.Sum(nil), data)
+		}
+		return &blob
+	}
+	linkLen := (len(node.Bytes()) + (256*1024 - 1)) / (256 * 1024)
+	hight := 0
+	tmp := linkLen
+	for {
+		hight++
+		tmp /= 4096
+		if tmp == 0 {
+			break
+		}
+	}
+	res, _ := dfsForSliceFile(hight, node, store, 0, h)
+	return res
 }
 
-// 处理文件夹，返回对应的obj指针
-func handleDir(node Node, store KVStore, h hash.Hash) *Object {
-	dirNode, _ := node.(Dir)
-	iter := dirNode.It()
+func sliceDir(node Dir, store KVStore, h hash.Hash) *Object {
+	iter := node.It()
 	treeObject := &Object{}
 	for iter.Next() {
 		node := iter.Node()
-		switch node.Type() {
-		case FILE:
+		if node.Type() == FILE {
 			file := node.(File)
-			tmp := handleFile(node, store, h)
+			tmp := sliceFile(file, store, h)
 			jsonMarshal, _ := json.Marshal(tmp)
+			h.Reset()
+			h.Write(jsonMarshal)
 			treeObject.Links = append(treeObject.Links, Link{
-				Hash: computeHash(jsonMarshal, h),
+				Hash: h.Sum(nil),
 				Size: int(file.Size()),
 				Name: file.Name(),
 			})
+			typeName := "link"
 			if tmp.Links == nil {
-				treeObject.Data = append(treeObject.Data, []byte(BLOB)...)
-			} else {
-				treeObject.Data = append(treeObject.Data, []byte(LIST)...)
+				typeName = "blob"
 			}
-
-			break
-		case DIR:
+			treeObject.Data = append(treeObject.Data, []byte(typeName)...)
+		} else {
 			dir := node.(Dir)
-			tmp := handleDir(node, store, h)
+			tmp := sliceDir(dir, store, h)
 			jsonMarshal, _ := json.Marshal(tmp)
+			h.Reset()
+			h.Write(jsonMarshal)
 			treeObject.Links = append(treeObject.Links, Link{
-				Hash: computeHash(jsonMarshal, h),
+				Hash: h.Sum(nil),
 				Size: int(dir.Size()),
 				Name: dir.Name(),
 			})
-			treeObject.Data = append(treeObject.Data, []byte(TREE)...)
-			break
+			typeName := "tree"
+			treeObject.Data = append(treeObject.Data, []byte(typeName)...)
 		}
 	}
-	putObjInStore(treeObject, store, h)
+	jsonMarshal, _ := json.Marshal(treeObject)
+	h.Reset()
+	h.Write(jsonMarshal)
+	flag, _ := store.Has(h.Sum(nil))
+	if !flag {
+		store.Put(h.Sum(nil), jsonMarshal)
+	}
 	return treeObject
 }
-
-// 处理大文件的方法 递归调用，返回当前生成的obj已经处理了多少数据
-func dfshandleFile(height int, node File, store KVStore, start int, h hash.Hash) (*Object, int) {
-	obj := &Object{}
-	lendata := 0
-	// 如果只分一层
-	if height == 1 {
-		if len(node.Bytes())-start < CHUNK_SIZE {
-			data := node.Bytes()[start:]
-			obj.Data = append(obj.Data, data...)
-			lendata = len(data)
-			putObjInStore(obj, store, h)
-			return obj, lendata
-		} else {
-			for i := 1; i <= MAX_LISTLINE; i++ {
-				end := start + CHUNK_SIZE
-				// 确保不越界
-				if end > len(node.Bytes()) {
-					end = len(node.Bytes())
-				}
-				data := node.Bytes()[start:end]
-				blobObj := Object{
-					Links: nil,
-					Data:  data,
-				}
-				putObjInStore(&blobObj, store, h)
-				jsonMarshal, _ := json.Marshal(blobObj)
-				obj.Links = append(obj.Links, Link{
-					Hash: computeHash(jsonMarshal, h),
-					Size: int(len(data)),
-				})
-				obj.Data = append(obj.Data, []byte(BLOB)...)
-				lendata += len(data)
-				start += CHUNK_SIZE
-				if start >= len(node.Bytes()) {
-					break
-				}
-			}
-			putObjInStore(obj, store, h)
-			return obj, lendata
-		}
+func Add(store KVStore, node Node, h hash.Hash) []byte {
+	// TODO 将分片写入到KVStore中，并返回Merkle Root
+	if node.Type() == FILE {
+		file := node.(File)
+		tmp := sliceFile(file, store, h)
+		jsonMarshal, _ := json.Marshal(tmp)
+		h.Write(jsonMarshal)
+		return h.Sum(nil)
 	} else {
-		for i := 1; i <= MAX_LISTLINE; i++ {
-			if start >= len(node.Bytes()) {
-				break
-			}
-			tmpObj, tmpLendata := dfshandleFile(height-1, node, store, start, h)
-			lendata += tmpLendata
-			jsonMarshal, _ := json.Marshal(tmpObj)
-			obj.Links = append(obj.Links, Link{
-				Hash: computeHash(jsonMarshal, h),
-				Size: tmpLendata,
-			})
-			if tmpObj.Links == nil {
-				obj.Data = append(obj.Data, []byte(BLOB)...)
-			} else {
-				obj.Data = append(obj.Data, []byte(LIST)...)
-			}
-			start += tmpLendata
-		}
-		putObjInStore(obj, store, h)
-		return obj, lendata
+		dir := node.(Dir)
+		tmp := sliceDir(dir, store, h)
+		jsonMarshal, _ := json.Marshal(tmp)
+		h.Write(jsonMarshal)
+		return h.Sum(nil)
 	}
-}
-
-func computeHash(data []byte, h hash.Hash) []byte {
-
-	h.Reset()
-	h.Write(data)
-	return h.Sum(nil)
-}
-func putObjInStore(obj *Object, store KVStore, h hash.Hash) {
-	value, err := json.Marshal(obj)
-	if err != nil {
-		fmt.Println("json.Marshal err:", err)
-		return
-	}
-	hash := computeHash(value, h)
-	has, _ := store.Has(hash)
-	if has {
-		return
-	}
-	// fmt.Println("put obj in store:",hash)
-	store.Put(hash, value)
-
 }
